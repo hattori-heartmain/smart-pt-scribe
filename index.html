@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart PT Scribe</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        body { font-family: 'Inter', 'Noto Sans JP', sans-serif; }
+        .animate-pulse-red { animation: pulse-red 2s infinite; }
+        @keyframes pulse-red {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+        .shake { animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
+        @keyframes shake {
+            10%, 90% { transform: translate3d(-1px, 0, 0); }
+            20%, 80% { transform: translate3d(2px, 0, 0); }
+            30%, 50%, 70% { transform: translate3d(-4px, 0, 0); }
+            40%, 60% { transform: translate3d(4px, 0, 0); }
+        }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // ============================================================
+        // ★ ここにデプロイしたGAS WebアプリのURLを貼り付けてください ★
+        // ============================================================
+        const GAS_ENDPOINT = localStorage.getItem('gas_endpoint') || '';
+
+        const INTERVIEW_STEPS_INITIAL = [
+            { id: 'S', label: '主観的情報 (S)', question: '主訴や経過について教えてください。' },
+            { id: 'O', label: '客観的情報 (O)', question: 'ROMや身体所見などの客観的データを教えてください。' },
+            { id: 'A', label: '評価・判断 (A)', question: '評価やプロブレムリストを教えてください。' },
+            { id: 'P', label: '治療計画 (P)', question: '今後の目標や計画について教えてください。' }
+        ];
+
+        const INTERVIEW_STEPS_RE_EXAM = [
+            { id: 'S', label: '主観的情報 (S)', question: '今日の具合や変化について教えてください。' },
+            { id: 'O', label: '動作レベル (O)', question: '歩行や立ち上がりなどの動作レベルの変化を教えてください。' },
+            { id: 'A', label: '評価・内容 (A/内容)', question: '今日のリハビリ内容と、その評価を教えてください。' },
+            { id: 'P', label: '今後の方針 (P)', question: '次回の予定や今後の流れを教えてください。' }
+        ];
+
+        const App = () => {
+            const [activeTab, setActiveTab] = useState('input');
+            const [examType, setExamType] = useState('initial');
+            const [inputMode, setInputMode] = useState('free');
+            const [transcript, setTranscript] = useState('');
+            const [clinicalNote, setClinicalNote] = useState('');
+            const [interviewData, setInterviewData] = useState({ S: '', O: '', A: '', P: '' });
+            const [currentStepIndex, setCurrentStepIndex] = useState(0);
+            const [output, setOutput] = useState('');
+            const [isLoading, setIsLoading] = useState(false);
+            const [error, setError] = useState(null);
+            const [copySuccess, setCopySuccess] = useState(false);
+            const [isRecording, setIsRecording] = useState(false);
+
+            const [gasEndpoint, setGasEndpoint] = useState(GAS_ENDPOINT);
+            const [showSettings, setShowSettings] = useState(false);
+            const [tempEndpoint, setTempEndpoint] = useState(gasEndpoint);
+
+            const [audioDevices, setAudioDevices] = useState([]);
+            const [selectedMicId, setSelectedMicId] = useState(localStorage.getItem('selected_mic_id') || '');
+            const [micPermission, setMicPermission] = useState('unknown');
+            const [isMicLoading, setIsMicLoading] = useState(false);
+
+            const recognitionRef = useRef(null);
+            const steps = examType === 'initial' ? INTERVIEW_STEPS_INITIAL : INTERVIEW_STEPS_RE_EXAM;
+
+            const updateDevices = async () => {
+                try {
+                    const devices = await navigator.mediaDevices.enumerateDevices();
+                    const audioInputs = devices.filter(device => device.kind === 'audioinput');
+                    setAudioDevices(audioInputs);
+                } catch (err) {
+                    console.error("Device error:", err);
+                }
+            };
+
+            const requestMicAccess = async () => {
+                setIsMicLoading(true);
+                setError(null);
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    setMicPermission('granted');
+                    stream.getTracks().forEach(track => track.stop());
+                    await updateDevices();
+                    alert("マイクの接続に成功しました！音声入力を開始できます。");
+                } catch (err) {
+                    console.error("Access error details:", err);
+                    setMicPermission('denied');
+
+                    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                        setError("ブラウザの設定によりマイクがブロックされています。URL横の「鍵マーク」＞「サイト設定」＞「権限をリセット」を行い、ページを再読み込みしてください。");
+                    } else {
+                        setError("マイクの起動に失敗しました: " + err.message);
+                    }
+                } finally {
+                    setIsMicLoading(false);
+                }
+            };
+
+            useEffect(() => {
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (SpeechRecognition) {
+                    const recognition = new SpeechRecognition();
+                    recognition.lang = 'ja-JP';
+                    recognition.continuous = true;
+                    recognition.interimResults = false;
+
+                    recognition.onresult = (event) => {
+                        const text = event.results[event.results.length - 1][0].transcript;
+                        if (inputMode === 'free') {
+                            setTranscript(prev => prev + (prev ? '\n' : '') + text);
+                        } else {
+                            const stepId = steps[currentStepIndex].id;
+                            setInterviewData(prev => ({
+                                ...prev,
+                                [stepId]: prev[stepId] + (prev[stepId] ? ' ' : '') + text
+                            }));
+                        }
+                    };
+
+                    recognition.onend = () => { if (isRecording) recognition.start(); };
+                    recognitionRef.current = recognition;
+                }
+                lucide.createIcons();
+
+                if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+                    navigator.mediaDevices.enumerateDevices().then(devices => {
+                        if (devices.some(d => d.label !== "")) {
+                            setMicPermission('granted');
+                            updateDevices();
+                        }
+                    });
+                }
+            }, [inputMode, currentStepIndex, isRecording, examType]);
+
+            useEffect(() => { lucide.createIcons(); }, [activeTab, isRecording, examType, inputMode, showSettings, micPermission, audioDevices, isMicLoading, error]);
+
+            const startRecording = () => {
+                if (!recognitionRef.current) { setError("お使いの環境では音声認識機能が利用できません。Chromeを使用してください。"); return; }
+                if (micPermission !== 'granted') {
+                    setError("マイクの使用許可が必要です。設定画面（歯車）を開き、許可ボタンを押してください。");
+                    setShowSettings(true);
+                    return;
+                }
+                setError(null);
+                setIsRecording(true);
+                try {
+                    recognitionRef.current.start();
+                } catch (e) {
+                    console.error("Start error:", e);
+                    setError("音声認識の開始に失敗しました。ページを更新して再度お試しください。");
+                    setIsRecording(false);
+                }
+            };
+
+            const stopRecording = () => {
+                if (recognitionRef.current) {
+                    setIsRecording(false);
+                    recognitionRef.current.stop();
+                }
+            };
+
+            const resetInput = () => {
+                if(confirm("入力をリセットしますか？")) {
+                  setTranscript('');
+                  setClinicalNote('');
+                  setInterviewData({ S: '', O: '', A: '', P: '' });
+                  setCurrentStepIndex(0);
+                  setOutput('');
+                }
+            };
+
+            const saveEndpoint = () => {
+                setGasEndpoint(tempEndpoint);
+                localStorage.setItem('gas_endpoint', tempEndpoint);
+                alert("GASエンドポイントを保存しました。");
+            };
+
+            const generateSOAP = async () => {
+                if (!gasEndpoint) { setError("GASエンドポイントURLが必要です。設定画面で入力してください。"); setShowSettings(true); return; }
+                let finalInput = inputMode === 'interview'
+                    ? `書き起こし:\nS: ${interviewData.S}\nO: ${interviewData.O}\nA: ${interviewData.A}\nP: ${interviewData.P}`
+                    : `書き起こし:\n${transcript}\n\n診察メモ:\n${clinicalNote}`;
+
+                if (!finalInput.trim() || finalInput.trim() === '書き起こし:\n\n\n診察メモ:') { setError("入力が空です。"); return; }
+                setIsLoading(true);
+                setError(null);
+
+                try {
+                    const response = await fetch(gasEndpoint, {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            input: finalInput,
+                            examType: examType
+                        })
+                    });
+                    const data = await response.json();
+                    if (data.error) throw new Error(data.error);
+                    if (data.result) {
+                        setOutput(data.result);
+                        setActiveTab('output');
+                    } else throw new Error("応答の取得に失敗しました。");
+                } catch (err) { setError("エラー: " + err.message); }
+                finally { setIsLoading(false); }
+            };
+
+            const handleCopy = () => {
+                const el = document.createElement('textarea');
+                el.value = output;
+                document.body.appendChild(el);
+                el.select();
+                document.execCommand('copy');
+                document.body.removeChild(el);
+                setCopySuccess(true);
+                setTimeout(() => setCopySuccess(false), 2000);
+            };
+
+            return (
+                <div className="min-h-screen p-4 md:p-8">
+                    <div className="max-w-4xl mx-auto">
+                        <header className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
+                            <div className="flex items-center gap-3">
+                                <div className="bg-blue-600 p-2 rounded-xl text-white shadow-lg"><i data-lucide="clipboard-check"></i></div>
+                                <div>
+                                    <h1 className="text-xl font-black tracking-tighter text-slate-800 uppercase leading-none">Smart PT Scribe</h1>
+                                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1 tracking-tighter">Rehab Chart Support</p>
+                                </div>
+                            </div>
+
+                            <div className="flex items-center gap-3 w-full md:w-auto">
+                                <div className="flex bg-white p-1 rounded-xl shadow-sm border border-slate-200 flex-1 md:flex-none">
+                                    <button onClick={() => { setExamType('initial'); resetInput(); }} className={`flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all flex-1 ${examType === 'initial' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}><i data-lucide="stethoscope" size="14"></i> 初診</button>
+                                    <button onClick={() => { setExamType('re-exam'); resetInput(); }} className={`flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all flex-1 ${examType === 're-exam' ? 'bg-green-600 text-white shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}><i data-lucide="history" size="14"></i> 再診</button>
+                                </div>
+                                <button onClick={() => setShowSettings(!showSettings)} className={`p-2.5 rounded-xl border transition-all ${showSettings ? 'bg-slate-800 border-slate-800 text-white shadow-md' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50 shadow-sm'}`} title="設定"><i data-lucide="settings" size="20"></i></button>
+                                <button onClick={resetInput} className="p-2.5 rounded-xl border bg-white border-slate-200 text-slate-400 hover:text-red-500 transition-all shadow-sm"><i data-lucide="rotate-ccw" size="20"></i></button>
+                            </div>
+                        </header>
+
+                        {showSettings && (
+                            <div className="mb-6 p-6 bg-white rounded-3xl border-2 border-slate-800 shadow-xl animate-in fade-in slide-in-from-top-4 duration-300 overflow-hidden">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                                    <div>
+                                        <div className="flex items-center gap-2 mb-4 text-slate-800"><i data-lucide="link" size="18"></i><h2 className="font-bold uppercase text-sm">GAS Endpoint URL</h2></div>
+                                        <div className="flex flex-col gap-2">
+                                            <input type="text" className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-100 outline-none transition-all" placeholder="https://script.google.com/macros/s/xxxxx/exec" value={tempEndpoint} onChange={(e) => setTempEndpoint(e.target.value)} />
+                                            <button onClick={saveEndpoint} className="w-full py-3 bg-slate-800 text-white font-bold rounded-xl text-sm hover:bg-slate-700 transition-all active:translate-y-0.5 shadow-md">保存する</button>
+                                            <p className="text-[10px] text-slate-400 leading-relaxed px-1">GASプロジェクトをWebアプリとしてデプロイし、そのURLを貼り付けてください。APIキーはGAS側で安全に管理されます。</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="border-t pt-8 md:border-t-0 md:pt-0 md:border-l md:pl-8">
+                                        <div className="flex items-center gap-2 mb-4 text-slate-800"><i data-lucide="mic" size="18"></i><h2 className="font-bold uppercase text-sm">マイクの準備</h2></div>
+                                        <div className="flex flex-col gap-3">
+                                            {micPermission !== 'granted' ? (
+                                                <div className="space-y-3 text-center">
+                                                    <button onClick={requestMicAccess} disabled={isMicLoading} className={`w-full py-3 text-white font-bold rounded-xl text-sm transition-all flex items-center justify-center gap-2 shadow-md ${isMicLoading ? 'bg-slate-400' : 'bg-blue-600 hover:bg-blue-700 animate-pulse'}`}>
+                                                        {isMicLoading ? <><i data-lucide="loader-2" className="animate-spin" size="16"></i>ブラウザの許可待ち...</> : <><i data-lucide="check-circle" size="16"></i>マイクの使用を許可する</>}
+                                                    </button>
+                                                    <div className="p-3 bg-amber-50 border border-amber-100 rounded-xl text-[10px] text-amber-700 leading-relaxed font-bold text-left">
+                                                      <p className="mb-1 uppercase tracking-widest text-[9px] opacity-60">マイクの許可が通らない場合：</p>
+                                                      <ul className="list-decimal pl-4 space-y-1">
+                                                        <li>ブラウザのURL横の<b>鍵マーク</b>をクリックし、マイクをオンにしてください。</li>
+                                                        <li>その後、ブラウザの<b>再読み込みボタン</b>を押してください。</li>
+                                                      </ul>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div className="space-y-3">
+                                                    <div className="p-3 bg-green-50 border border-green-100 rounded-xl flex items-center gap-2 shadow-inner">
+                                                        <i data-lucide="check-circle-2" size="16" className="text-green-600"></i>
+                                                        <span className="text-xs font-bold text-green-700">マイクは正常に接続されています</span>
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="flex bg-slate-200/50 p-1 rounded-2xl mb-6 shadow-inner">
+                            <button onClick={() => setActiveTab('input')} className={`flex-1 py-3 text-sm font-bold rounded-xl transition-all ${activeTab === 'input' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>入力</button>
+                            <button onClick={() => setActiveTab('output')} disabled={!output} className={`flex-1 py-3 text-sm font-bold rounded-xl transition-all ${activeTab === 'output' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 opacity-50'}`}>生成結果</button>
+                        </div>
+
+                        {activeTab === 'input' && (
+                            <div className="space-y-6 animate-in fade-in duration-500">
+                                <div className="grid grid-cols-2 gap-3">
+                                    <button onClick={() => { setInputMode('free'); stopRecording(); }} className={`p-4 rounded-2xl border-2 text-left transition-all ${inputMode === 'free' ? 'border-blue-500 bg-blue-50/50 shadow-sm' : 'border-slate-200 bg-white hover:border-slate-300'}`}><i data-lucide="message-square" className={inputMode === 'free' ? 'text-blue-500' : 'text-slate-400'}></i><div className="mt-2 font-bold text-sm">自由入力</div></button>
+                                    <button onClick={() => { setInputMode('interview'); stopRecording(); setCurrentStepIndex(0); }} className={`p-4 rounded-2xl border-2 text-left transition-all ${inputMode === 'interview' ? 'border-indigo-500 bg-indigo-50/50 shadow-sm' : 'border-slate-200 bg-white hover:border-slate-300'}`}><i data-lucide="volume-2" className={inputMode === 'interview' ? 'text-indigo-500' : 'text-slate-400'}></i><div className="mt-2 font-bold text-sm">一問一答</div></button>
+                                </div>
+
+                                <div className="flex gap-2">
+                                    <button onClick={startRecording} disabled={isRecording} className={`flex-1 flex items-center justify-center gap-2 py-4 rounded-2xl font-bold transition-all shadow-md active:scale-95 ${isRecording ? 'bg-slate-100 text-slate-300 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700'}`}><i data-lucide="mic" size="20"></i> 音声開始</button>
+                                    <button onClick={stopRecording} disabled={!isRecording} className={`flex-1 flex items-center justify-center gap-2 py-4 rounded-2xl font-bold transition-all shadow-md active:scale-95 ${!isRecording ? 'bg-slate-100 text-slate-300 cursor-not-allowed' : 'bg-red-500 text-white animate-pulse'}`}><i data-lucide="mic-off" size="20"></i> 音声終了</button>
+                                </div>
+
+                                {inputMode === 'free' ? (
+                                    <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
+                                        <div className="flex justify-between items-center mb-4 text-slate-700">
+                                            <h2 className="font-bold flex items-center gap-2"><i data-lucide="file-text" size="18" className="text-blue-500"></i>記録エリア ({examType === 'initial' ? '初診' : '再診'})</h2>
+                                            {isRecording && <span className="text-red-500 text-xs font-bold animate-pulse flex items-center gap-1"><span className="w-1.5 h-1.5 bg-red-500 rounded-full"></span>録音中</span>}
+                                        </div>
+                                        <textarea className="w-full h-48 p-4 bg-slate-50 border-none rounded-2xl text-sm outline-none focus:ring-2 focus:ring-blue-100 transition-all leading-relaxed font-medium" value={transcript} onChange={(e) => setTranscript(e.target.value)} placeholder="マイクをオンにしてお話しいただくか、直接メモを入力してください..."/>
+                                    </div>
+                                ) : (
+                                    <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100 animate-in slide-in-from-right-4 duration-300">
+                                        <div className="flex items-center justify-between mb-4">
+                                            <span className={`text-[10px] font-black px-3 py-1 rounded-full uppercase tracking-widest ${examType === 'initial' ? 'text-blue-600 bg-blue-100' : 'text-green-600 bg-green-100'}`}>Step {currentStepIndex + 1} / 4</span>
+                                            {isRecording && <span className="text-red-500 text-xs font-bold animate-pulse flex items-center gap-1"><span className="w-1.5 h-1.5 bg-red-500 rounded-full"></span>録音中</span>}
+                                        </div>
+                                        <h3 className="text-lg font-bold text-slate-800 mb-1 leading-tight tracking-tighter">{steps[currentStepIndex].question}</h3>
+                                        <textarea className="w-full h-32 p-4 bg-slate-50 border-none rounded-2xl text-sm mb-4 outline-none focus:ring-2 focus:ring-blue-100 transition-all leading-relaxed font-medium" value={interviewData[steps[currentStepIndex].id]} readOnly placeholder="お話しください..." />
+                                        <button onClick={() => { if (currentStepIndex < steps.length - 1) setCurrentStepIndex(currentStepIndex + 1); else stopRecording(); }} className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold hover:bg-slate-800 transition-all shadow-lg active:scale-[0.98]">確定して次へ</button>
+                                    </div>
+                                )}
+
+                                <button onClick={generateSOAP} disabled={isLoading || isRecording} className={`w-full py-5 text-white font-black rounded-3xl shadow-xl transition-all active:scale-95 disabled:opacity-50 disabled:shadow-none ${examType === 'initial' ? 'bg-blue-600 shadow-blue-100 hover:bg-blue-700' : 'bg-green-600 shadow-green-100 hover:bg-green-700'}`}>
+                                    {isLoading ? <span className="flex items-center gap-2"><i data-lucide="loader-2" className="animate-spin"></i> 生成中...</span> : "要約を生成する"}
+                                </button>
+                                {error && <div className="p-4 bg-red-50 text-red-600 rounded-2xl text-xs font-bold flex items-start gap-2 border border-red-100 animate-in shake duration-300 shadow-sm leading-relaxed"><i data-lucide="alert-circle" size="16" className="shrink-0 mt-0.5"></i> <span>{error}</span></div>}
+                            </div>
+                        )}
+
+                        {activeTab === 'output' && (
+                            <div className="bg-white p-6 rounded-3xl shadow-xl border border-slate-100 animate-in zoom-in-95 duration-300">
+                                <div className="flex justify-between items-center mb-6">
+                                    <h2 className="font-black text-lg text-slate-800 flex items-center gap-2"><i data-lucide="check-circle-2" className="text-green-500"></i>生成結果</h2>
+                                    <button onClick={handleCopy} className={`px-5 py-2 rounded-xl text-sm font-bold flex items-center gap-2 transition-all ${copySuccess ? 'bg-green-500 text-white shadow-md' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>
+                                        {copySuccess ? <><i data-lucide="check" size="16"></i> コピー完了</> : <><i data-lucide="copy" size="16"></i> コピー</>}
+                                    </button>
+                                </div>
+                                <pre className="text-sm font-mono whitespace-pre-wrap leading-relaxed text-slate-700 bg-slate-50 p-6 rounded-2xl border border-slate-100 min-h-[200px] overflow-x-auto selection:bg-blue-200 font-medium">{output}</pre>
+                                <button onClick={() => setActiveTab('input')} className="w-full mt-6 py-4 border-2 border-slate-100 text-slate-500 font-bold rounded-2xl hover:bg-slate-50 transition-all active:translate-y-0.5">戻って修正する</button>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
