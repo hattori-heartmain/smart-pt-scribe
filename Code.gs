@@ -3,7 +3,7 @@
 //   プロパティ名: GEMINI_API_KEY
 //   値: あなたのGemini APIキー
 
-const MODELS = ["gemini-3.0-flash", "gemini-2.5-flash"];
+const MODELS = ["gemini-3-flash-preview", "gemini-2.5-flash"];
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
 
