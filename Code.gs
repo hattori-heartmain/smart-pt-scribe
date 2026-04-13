@@ -3,7 +3,9 @@
 //   プロパティ名: GEMINI_API_KEY
 //   値: あなたのGemini APIキー
 
-const MODEL_NAME = "gemini-2.5-flash";
+const MODELS = ["gemini-3.0-flash", "gemini-2.5-flash"];
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 2000;
 
 const SYSTEM_PROMPT_INITIAL = `
 <role>あなたは診療録作成を担当する「医師事務作業補助者（シュライバー）」です。</role>
@@ -67,29 +69,43 @@ function doPost(e) {
 
     const systemPrompt = examType === 'initial' ? SYSTEM_PROMPT_INITIAL : SYSTEM_PROMPT_RE_EXAM;
 
-    const response = UrlFetchApp.fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`,
-      {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify({
-          contents: [{ parts: [{ text: input }] }],
-          systemInstruction: { parts: [{ text: systemPrompt }] }
-        }),
-        muteHttpExceptions: true
+    let text = '';
+    let lastError = '';
+
+    for (const model of MODELS) {
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+          Utilities.sleep(RETRY_DELAY_MS * attempt);
+        }
+
+        const response = UrlFetchApp.fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          {
+            method: 'post',
+            contentType: 'application/json',
+            payload: JSON.stringify({
+              contents: [{ parts: [{ text: input }] }],
+              systemInstruction: { parts: [{ text: systemPrompt }] }
+            }),
+            muteHttpExceptions: true
+          }
+        );
+
+        const result = JSON.parse(response.getContentText());
+
+        if (!result.error) {
+          text = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          if (text) {
+            return ContentService.createTextOutput(JSON.stringify({ result: text, model: model }))
+              .setMimeType(ContentService.MimeType.JSON);
+          }
+        }
+
+        lastError = result.error?.message || 'レスポンスが空です';
       }
-    );
-
-    const result = JSON.parse(response.getContentText());
-
-    if (result.error) {
-      return ContentService.createTextOutput(JSON.stringify({ error: result.error.message }))
-        .setMimeType(ContentService.MimeType.JSON);
     }
 
-    const text = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-    return ContentService.createTextOutput(JSON.stringify({ result: text }))
+    return ContentService.createTextOutput(JSON.stringify({ error: lastError }))
       .setMimeType(ContentService.MimeType.JSON);
 
   } catch (err) {
