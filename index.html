@@ -37,7 +37,9 @@
         // ============================================================
         // ★ ここにデプロイしたGAS WebアプリのURLを貼り付けてください ★
         // ============================================================
-        const GAS_ENDPOINT = localStorage.getItem('gas_endpoint') || '';
+        // 既定のエンドポイント。設定画面で保存した値(localStorage)があればそちらが優先される。
+        const DEFAULT_GAS_ENDPOINT = 'https://script.google.com/macros/s/AKfycbwXvbRWHRuPCidViJuzmongPhzMDrNDZ1OShKJW8zlwUrHEXT_JWF6fYZJc7nX0aG7X/exec';
+        const GAS_ENDPOINT = localStorage.getItem('gas_endpoint') || DEFAULT_GAS_ENDPOINT;
 
         const INTERVIEW_STEPS_INITIAL = [
             { id: 'S', label: '主観的情報 (S)', question: '主訴や経過について教えてください。' },
