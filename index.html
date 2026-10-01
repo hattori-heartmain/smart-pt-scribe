@@ -81,6 +81,14 @@
             const recognitionRef = useRef(null);
             const steps = examType === 'initial' ? INTERVIEW_STEPS_INITIAL : INTERVIEW_STEPS_RE_EXAM;
 
+            // 音声認識のコールバックから最新の状態を参照するための ref
+            // （インスタンスは1つだけ作り、状態変化のたびに作り直さない）
+            const isRecordingRef = useRef(false);
+            const inputModeRef = useRef(inputMode);
+            const stepIdRef = useRef(steps[currentStepIndex].id);
+            inputModeRef.current = inputMode;
+            stepIdRef.current = steps[currentStepIndex].id;
+
             const updateDevices = async () => {
                 try {
                     const devices = await navigator.mediaDevices.enumerateDevices();
@@ -91,15 +99,19 @@
                 }
             };
 
-            const requestMicAccess = async () => {
+            const requestMicAccess = async ({ silent = false } = {}) => {
                 setIsMicLoading(true);
                 setError(null);
                 try {
+                    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                        throw new Error("このページではマイクを利用できません（https で開いているか確認してください）");
+                    }
                     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                     setMicPermission('granted');
                     stream.getTracks().forEach(track => track.stop());
                     await updateDevices();
-                    alert("マイクの接続に成功しました！音声入力を開始できます。");
+                    if (!silent) alert("マイクの接続に成功しました！音声入力を開始できます。");
+                    return true;
                 } catch (err) {
                     console.error("Access error details:", err);
                     setMicPermission('denied');
@@ -109,6 +121,7 @@
                     } else {
                         setError("マイクの起動に失敗しました: " + err.message);
                     }
+                    return false;
                 } finally {
                     setIsMicLoading(false);
                 }
@@ -123,21 +136,58 @@
                     recognition.interimResults = false;
 
                     recognition.onresult = (event) => {
-                        const text = event.results[event.results.length - 1][0].transcript;
-                        if (inputMode === 'free') {
-                            setTranscript(prev => prev + (prev ? '\n' : '') + text);
-                        } else {
-                            const stepId = steps[currentStepIndex].id;
-                            setInterviewData(prev => ({
-                                ...prev,
-                                [stepId]: prev[stepId] + (prev[stepId] ? ' ' : '') + text
-                            }));
+                        for (let i = event.resultIndex; i < event.results.length; i++) {
+                            if (!event.results[i].isFinal) continue;
+                            const text = event.results[i][0].transcript.trim();
+                            if (!text) continue;
+                            if (inputModeRef.current === 'free') {
+                                setTranscript(prev => prev + (prev ? '\n' : '') + text);
+                            } else {
+                                const stepId = stepIdRef.current;
+                                setInterviewData(prev => ({
+                                    ...prev,
+                                    [stepId]: prev[stepId] + (prev[stepId] ? ' ' : '') + text
+                                }));
+                            }
                         }
                     };
 
-                    recognition.onend = () => { if (isRecording) recognition.start(); };
+                    recognition.onerror = (event) => {
+                        // no-speech（無音）と aborted（停止操作）は録音を続行／無視してよい
+                        if (event.error === 'no-speech' || event.error === 'aborted') return;
+                        const messages = {
+                            'not-allowed': "マイクの使用が許可されていません。URL横の「鍵マーク」＞「サイト設定」でマイクを許可し、ページを再読み込みしてください。",
+                            'service-not-allowed': "このブラウザでは音声認識が許可されていません。PCまたはAndroidのGoogle Chromeでお試しください。",
+                            'audio-capture': "マイクが見つかりません。マイクの接続を確認してください。",
+                            'network': "音声認識サーバーに接続できません。インターネット接続を確認してください。",
+                            'language-not-supported': "日本語の音声認識に対応していないブラウザです。Google Chromeでお試しください。"
+                        };
+                        isRecordingRef.current = false;
+                        setIsRecording(false);
+                        setError(messages[event.error] || `音声認識でエラーが発生しました（${event.error}）。もう一度「音声開始」を押してください。`);
+                    };
+
+                    // Chromeは無音が続くと自動で認識を終了するため、録音中なら再開する
+                    recognition.onend = () => {
+                        if (!isRecordingRef.current) return;
+                        try {
+                            recognition.start();
+                        } catch (e) {
+                            console.error("Restart error:", e);
+                            isRecordingRef.current = false;
+                            setIsRecording(false);
+                        }
+                    };
                     recognitionRef.current = recognition;
                 }
+
+                return () => {
+                    isRecordingRef.current = false;
+                    if (recognitionRef.current) recognitionRef.current.abort();
+                };
+            }, []);
+
+            useEffect(() => {
                 lucide.createIcons();
 
                 if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
@@ -148,33 +198,37 @@
                         }
                     });
                 }
-            }, [inputMode, currentStepIndex, isRecording, examType]);
+            }, []);
 
             useEffect(() => { lucide.createIcons(); }, [activeTab, isRecording, examType, inputMode, showSettings, micPermission, audioDevices, isMicLoading, error]);
 
-            const startRecording = () => {
-                if (!recognitionRef.current) { setError("お使いの環境では音声認識機能が利用できません。Chromeを使用してください。"); return; }
+            const startRecording = async () => {
+                if (!recognitionRef.current) { setError("お使いの環境では音声認識機能が利用できません。Google Chromeを使用してください。"); return; }
+                if (isRecordingRef.current) return;
                 if (micPermission !== 'granted') {
-                    setError("マイクの使用許可が必要です。設定画面（歯車）を開き、許可ボタンを押してください。");
-                    setShowSettings(true);
-                    return;
+                    // 未許可ならその場でブラウザの許可ダイアログを出す
+                    const ok = await requestMicAccess({ silent: true });
+                    if (!ok) { setShowSettings(true); return; }
                 }
                 setError(null);
+                isRecordingRef.current = true;
                 setIsRecording(true);
                 try {
                     recognitionRef.current.start();
                 } catch (e) {
+                    // 既に認識中（InvalidStateError）の場合はそのまま継続
+                    if (e.name === 'InvalidStateError') return;
                     console.error("Start error:", e);
                     setError("音声認識の開始に失敗しました。ページを更新して再度お試しください。");
+                    isRecordingRef.current = false;
                     setIsRecording(false);
                 }
             };
 
             const stopRecording = () => {
-                if (recognitionRef.current) {
-                    setIsRecording(false);
-                    recognitionRef.current.stop();
-                }
+                isRecordingRef.current = false;
+                setIsRecording(false);
+                if (recognitionRef.current) recognitionRef.current.stop();
             };
 
             const resetInput = () => {
